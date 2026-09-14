@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -17,13 +18,24 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/codebuild"
-	"github.com/aws/aws-sdk-go-v2/service/codebuild/types"
 	codebuildTypes "github.com/aws/aws-sdk-go-v2/service/codebuild/types"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/joho/godotenv"
+
 	"github.com/moby/moby/api/types/registry"
 	"github.com/moby/moby/client"
+)
+
+// ANSI color helpers
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorCyan   = "\033[36m"
+	colorBold   = "\033[1m"
+	colorDim    = "\033[2m"
 )
 
 type SarifReport struct {
@@ -63,37 +75,53 @@ func main() {
     }
 	ctx := context.Background()
 
+	// 0. Parse Command Line Arguments
+	imageFlag := flag.String("image", "project:latest", "Target local Docker image to scan (e.g. project:latest)")
+	userFlag := flag.String("user", "user-1", "Tenant/User identifier")
+	verboseFlag := flag.Bool("verbose", false, "Enable detailed debug and raw engine output")
+	flag.BoolVar(verboseFlag, "v", false, "Shorthand for --verbose")
+	failOnVulnFlag := flag.Bool("fail-on-vuln", true, "Exit with non-zero code if security issues are discovered")
+	flag.Parse()
+
+	logStep := func(step int, total int, message string) {
+		fmt.Printf("%s[%d/%d]%s %s%s%s\n", colorCyan, step, total, colorReset, colorBold, message, colorReset)
+	}
+
+	debugLog := func(format string, a ...any) {
+		if *verboseFlag {
+			fmt.Printf(colorDim+"[DEBUG] "+format+colorReset+"\n", a...)
+		}
+	}
+
 	lambdaURL := os.Getenv("LAMBDA_URL")
-    
-	// 1. Fetch the temporary STS tokens dynamically from the Lambda Function URL
-	// REPLACE THIS STRING WITH YOUR ACTUAL LAMBDA URL
- 
-	
-	fmt.Println("Requesting secure upload tokens from AWS...")
+	bucketName := os.Getenv("BUCKET_NAME")
+	projectName := "code-scanner"
+
+	// 1. Fetch Temporary STS Credentials from Lambda
+	logStep(1, 4, "Authenticating with Token Vendor...")
 	requestBody, _ := json.Marshal(map[string]string{
-		"userId": "user-1", // Simulating the logged-in CLI user
+		"userId": *userFlag,
 	})
 
 	resp, err := http.Post(lambdaURL, "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
-		panic("failed to connect to Lambda: " + err.Error())
+		log.Fatalf("%sFailed to connect to authentication endpoint: %v%s", colorRed, err, colorReset)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		panic(fmt.Sprintf("failed to get tokens, status code: %d", resp.StatusCode))
+		log.Fatalf("%sAuthentication failed with status code: %d%s", colorRed, resp.StatusCode, colorReset)
 	}
 
 	var tokens TokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokens); err != nil {
-		panic("failed to parse Lambda response: " + err.Error())
+		log.Fatalf("%sFailed to decode token response: %v%s", colorRed, err, colorReset)
 	}
-	fmt.Println("Tokens received successfully!")
 
-	localImage := "project:latest" // Make sure this image actually exists on your machine!
 	remoteTag := fmt.Sprintf("%s/%s:latest", tokens.RegistryUri, tokens.RepositoryPath)
+	debugLog("Assumed temporary role credentials successfully. Target tag: %s", remoteTag)
 
-	// 2. Configure AWS SDK specifically using the newly fetched temporary STS credentials
+	// 2. Configure AWS SDK
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion("ap-south-2"),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
@@ -103,36 +131,33 @@ func main() {
 		)),
 	)
 	if err != nil {
-		panic("unable to load AWS config: " + err.Error())
+		log.Fatalf("%sFailed to configure AWS SDK: %v%s", colorRed, err, colorReset)
 	}
 
-	// 3. Request the ECR Authorization Token to log into the Docker registry
+	// 3. Authenticate with ECR and Tag/Push Docker Image
+	logStep(2, 4, fmt.Sprintf("Pushing container image to ECR (%s)...", *imageFlag))
 	ecrClient := ecr.NewFromConfig(cfg)
 	authOutput, err := ecrClient.GetAuthorizationToken(ctx, &ecr.GetAuthorizationTokenInput{})
 	if err != nil {
-		panic("failed to get ECR auth token: " + err.Error())
+		log.Fatalf("%sFailed to acquire ECR auth token: %v%s", colorRed, err, colorReset)
 	}
 
 	authData := authOutput.AuthorizationData[0]
 	decodedToken, _ := base64.StdEncoding.DecodeString(*authData.AuthorizationToken)
 	password := strings.TrimPrefix(string(decodedToken), "AWS:")
 
-	// 4. Initialize the Docker Client
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
-		panic("failed to init docker client: " + err.Error())
+		log.Fatalf("%sFailed to initialize local Docker client: %v%s", colorRed, err, colorReset)
 	}
 
-	// 5. Tag the local image 
-	_, err = cli.ImageTag(ctx, client.ImageTagOptions{
-		Source: localImage,
+	if _, err := cli.ImageTag(ctx, client.ImageTagOptions{
+		Source: *imageFlag,
 		Target: remoteTag,
-	})
-	if err != nil {
-		panic("failed to tag image: " + err.Error())
+	}); err != nil {
+		log.Fatalf("%sFailed to tag local image '%s': %v%s", colorRed, *imageFlag, err, colorReset)
 	}
 
-	// 6. Base64-encode the Docker registry credentials
 	authConfig := registry.AuthConfig{
 		Username:      "AWS",
 		Password:      password,
@@ -141,24 +166,24 @@ func main() {
 	encodedAuth, _ := json.Marshal(authConfig)
 	authStr := base64.URLEncoding.EncodeToString(encodedAuth)
 
-	// 7. Execute the push directly to ECR
-	fmt.Printf("Pushing %s to ECR...\n", remoteTag)
 	pushOutput, err := cli.ImagePush(ctx, remoteTag, client.ImagePushOptions{
 		RegistryAuth: authStr,
 	})
 	if err != nil {
-		panic("failed to push image: " + err.Error())
+		log.Fatalf("%sFailed to push image to ECR: %v%s", colorRed, err, colorReset)
 	}
 	defer pushOutput.Close()
 
-	io.Copy(os.Stdout, pushOutput)
-	fmt.Println("\nSuccessfully pushed image to AWS ECR!")
+	if *verboseFlag {
+		io.Copy(os.Stdout, pushOutput)
+	} else {
+		// Discard verbose layer logs in minimal mode
+		io.Copy(io.Discard, pushOutput)
+	}
 
-	// Initialize the CodeBuild client using your existing AWS config (vended via STS)
+	// 4. Trigger CodeBuild Security Scan
+	logStep(3, 4, "Triggering CodeQL security analysis...")
 	cbClient := codebuild.NewFromConfig(cfg)
-	projectName := "code-scanner"
-
-	fmt.Printf("Triggering security scan for image: %s\n", remoteTag)
 
 	startBuildResp, err := cbClient.StartBuild(ctx, &codebuild.StartBuildInput{
 		ProjectName: &projectName,
@@ -171,96 +196,102 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatalf("failed to start security scan build: %v", err)
+		log.Fatalf("%sFailed to start CodeBuild scan: %v%s", colorRed, err, colorReset)
 	}
 
-	fmt.Println("Security scan build successfully triggered in CodeBuild!")
+	buildID := *startBuildResp.Build.Id
+	debugLog("CodeBuild job started with ID: %s", buildID)
 
-	// 1. Grab the unique build ID from the start response
-    buildID := *startBuildResp.Build.Id
-    fmt.Printf("Build started! ID: %s. Waiting for completion...\n", buildID)
+	// Poll CodeBuild status with safe intervals
+	fmt.Print("   Analysis in progress")
+	for {
+		batchResp, err := cbClient.BatchGetBuilds(ctx, &codebuild.BatchGetBuildsInput{
+			Ids: []string{buildID},
+		})
+		if err != nil {
+			log.Fatalf("\n%sFailed checking build status: %v%s", colorRed, err, colorReset)
+		}
 
-    // 2. Poll CodeBuild status
-    for {
-        batchResp, err := cbClient.BatchGetBuilds(ctx, &codebuild.BatchGetBuildsInput{
-            Ids: []string{buildID},
-        })
-        if err != nil {
-            log.Fatalf("failed to check build status: %v", err)
-        }
-        
-        status := batchResp.Builds[0].BuildStatus
-        if status == types.StatusTypeInProgress {
-            fmt.Print(".")
-            time.Sleep(15 * time.Second)
-            continue
-        }
-        
-        fmt.Printf("\nScan finished with status: %s\n", status)
-        if status != types.StatusTypeSucceeded {
-            log.Fatalf("Security scan failed or timed out. Check AWS console for logs.")
-        }
-        break
-    }
+		status := batchResp.Builds[0].BuildStatus
+		if status == codebuildTypes.StatusTypeInProgress {
+			fmt.Print(".")
+			time.Sleep(10 * time.Second)
+			continue
+		}
 
-    // 3. Construct the exact S3 key used by your buildspec
-    
-    // Assuming userID is extracted or available from your namespace logic (e.g. "user-1")
-    userID := "user-1" 
-    s3Key := fmt.Sprintf("reports/%s/codeql-scan-%s.sarif", userID, buildID)
-	bucketName := os.Getenv("BUCKET_NAME")
+		fmt.Println()
+		if status != codebuildTypes.StatusTypeSucceeded {
+			log.Fatalf("%sSecurity scan failed with status: %s. Check CodeBuild console for logs.%s", colorRed, status, colorReset)
+		}
+		break
+	}
 
-    fmt.Println("Downloading SARIF report from S3...")
-    
-    // 4. Download file from S3
-    s3Client := s3.NewFromConfig(cfg)
-    s3Resp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-        Bucket: aws.String(bucketName),
-        Key:    aws.String(s3Key),
-    })
-    if err != nil {
-        log.Fatalf("Failed to download report from S3: %v", err)
-    }
-    defer s3Resp.Body.Close()
+	// 5. Download and Parse SARIF Report
+	logStep(4, 4, "Retrieving and parsing security report...")
+	s3Key := fmt.Sprintf("reports/%s/codeql-scan-%s.sarif", *userFlag, buildID)
+	debugLog("Fetching report from s3://%s/%s", bucketName, s3Key)
 
-    bodyBytes, _ := io.ReadAll(s3Resp.Body)
+	s3Client := s3.NewFromConfig(cfg)
+	s3Resp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil {
+		log.Fatalf("%sFailed to download SARIF report from S3: %v%s", colorRed, err, colorReset)
+	}
+	defer s3Resp.Body.Close()
 
-    // 5. Parse and Pretty Print
-    var report SarifReport
-    if err := json.Unmarshal(bodyBytes, &report); err != nil {
-        log.Fatalf("Failed to parse SARIF data: %v", err)
-    }
+	bodyBytes, err := io.ReadAll(s3Resp.Body)
+	if err != nil {
+		log.Fatalf("%sFailed reading report body: %v%s", colorRed, err, colorReset)
+	}
 
-    fmt.Println("\n================= SECURITY VULNERABILITIES =================")
-    vulnerabilityCount := 0
+	var report SarifReport
+	if err := json.Unmarshal(bodyBytes, &report); err != nil {
+		log.Fatalf("%sFailed parsing SARIF JSON: %v%s", colorRed, err, colorReset)
+	}
 
-    if len(report.Runs) > 0 {
-        for _, result := range report.Runs[0].Results {
-            // Ignore informational telemetry like expected-extracted-files
-            if result.Level == "none" || strings.Contains(result.RuleID, "expected-extracted") {
-                continue
-            }
-            
-            vulnerabilityCount++
-            fileUri := "Unknown"
-            lineNo := 0
-            
-            if len(result.Locations) > 0 {
-                fileUri = result.Locations[0].PhysicalLocation.ArtifactLocation.URI
-                lineNo = result.Locations[0].PhysicalLocation.Region.StartLine
-            }
-            
-            fmt.Printf("[ %s ] Rule: %s\n", strings.ToUpper(result.Level), result.RuleID)
-            fmt.Printf("Location : %s:%d\n", fileUri, lineNo)
-            fmt.Printf("Details  : %s\n", result.Message.Text)
-            fmt.Println("------------------------------------------------------------")
-        }
-    }
+	// 6. Pretty Print Findings
+	fmt.Println()
+	fmt.Printf("%s%s====================== SCAN RESULTS ======================%s\n", colorBold, colorCyan, colorReset)
 
-    if vulnerabilityCount == 0 {
-        fmt.Println("✅ No vulnerabilities found! Your code passed the security check.")
-    } else {
-        fmt.Printf("❌ Found %d vulnerabilities.\n", vulnerabilityCount)
-    }
-    fmt.Println("============================================================")
+	vulnerabilityCount := 0
+
+	if len(report.Runs) > 0 {
+		for _, result := range report.Runs[0].Results {
+			if result.Level == "none" || strings.Contains(result.RuleID, "expected-extracted") {
+				continue
+			}
+
+			vulnerabilityCount++
+			fileUri := "Unknown"
+			lineNo := 0
+
+			if len(result.Locations) > 0 {
+				fileUri = result.Locations[0].PhysicalLocation.ArtifactLocation.URI
+				lineNo = result.Locations[0].PhysicalLocation.Region.StartLine
+			}
+
+			levelBadge := fmt.Sprintf("%s%s[%s]%s", colorBold, colorRed, strings.ToUpper(result.Level), colorReset)
+			if strings.EqualFold(result.Level, "warning") {
+				levelBadge = fmt.Sprintf("%s%s[%s]%s", colorBold, colorYellow, strings.ToUpper(result.Level), colorReset)
+			}
+
+			fmt.Printf("%s %s%s%s\n", levelBadge, colorBold, result.RuleID, colorReset)
+			fmt.Printf("   %s-->%s %s:%d\n", colorCyan, colorReset, fileUri, lineNo)
+			fmt.Printf("   %s\n\n", result.Message.Text)
+		}
+	}
+
+	fmt.Printf("%s%s==========================================================%s\n", colorBold, colorCyan, colorReset)
+
+	if vulnerabilityCount == 0 {
+		fmt.Printf("%s%s✔ SUCCESS: No security vulnerabilities found.%s\n\n", colorBold, colorGreen, colorReset)
+		os.Exit(0)
+	} else {
+		fmt.Printf("%s%s✖ FAILED: Found %d security vulnerabilities.%s\n\n", colorBold, colorRed, vulnerabilityCount, colorReset)
+		if *failOnVulnFlag {
+			os.Exit(1)
+		}
+	}
 }
