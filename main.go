@@ -79,6 +79,8 @@ func main() {
 	imageFlag := flag.String("image", "project:latest", "Target local Docker image to scan (e.g. project:latest)")
 	userFlag := flag.String("user", "user-1", "Tenant/User identifier")
 	verboseFlag := flag.Bool("verbose", false, "Enable detailed debug and raw engine output")
+	languageFlag := flag.String("lang", "javascript-typescript", "The language to scan (e.g., python, go, java-kotlin)")
+	buildCmdFlag := flag.String("build-cmd", "", "The build command for compiled languages (e.g., 'make' or 'go build')")
 	flag.BoolVar(verboseFlag, "v", false, "Shorthand for --verbose")
 	failOnVulnFlag := flag.Bool("fail-on-vuln", true, "Exit with non-zero code if security issues are discovered")
 	flag.Parse()
@@ -178,7 +180,44 @@ func main() {
 		io.Copy(os.Stdout, pushOutput)
 	} else {
 		// Discard verbose layer logs in minimal mode
-		io.Copy(io.Discard, pushOutput)
+		pushOutput, err := cli.ImagePush(ctx, remoteTag, client.ImagePushOptions{
+		RegistryAuth: authStr,
+	})
+	if err != nil {
+		log.Fatalf("%sFailed to initiate push to ECR: %v%s", colorRed, err, colorReset)
+	}
+	defer pushOutput.Close()
+
+	// Parse the Docker engine JSON stream to catch actual push errors
+	decoder := json.NewDecoder(pushOutput)
+	for {
+		var dockerMsg struct {
+			Error  string `json:"error"`
+			Status string `json:"status"`
+			ID     string `json:"id"`
+		}
+		
+		if err := decoder.Decode(&dockerMsg); err != nil {
+			if err == io.EOF {
+				break
+			}
+			break 
+		}
+
+		// If the daemon reports an error in the stream, halt the CLI
+		if dockerMsg.Error != "" {
+			log.Fatalf("\n%s✖ Docker Push Failed: %s%s\n", colorRed, dockerMsg.Error, colorReset)
+		}
+
+		// Print verbose logs if the flag is enabled
+		if *verboseFlag && dockerMsg.Status != "" {
+			if dockerMsg.ID != "" {
+				fmt.Printf("%s: %s\n", dockerMsg.ID, dockerMsg.Status)
+			} else {
+				fmt.Println(dockerMsg.Status)
+			}
+		}
+	}
 	}
 
 	// 4. Trigger CodeBuild Security Scan
@@ -188,12 +227,22 @@ func main() {
 	startBuildResp, err := cbClient.StartBuild(ctx, &codebuild.StartBuildInput{
 		ProjectName: &projectName,
 		EnvironmentVariablesOverride: []codebuildTypes.EnvironmentVariable{
-			{
-				Name:  aws.String("IMAGE_URI"),
-				Value: aws.String(remoteTag),
-				Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
-			},
+		{
+			Name:  aws.String("IMAGE_URI"),
+			Value: aws.String(remoteTag),
+			Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
 		},
+		{
+			Name:  aws.String("LANGUAGE"),
+			Value: aws.String(*languageFlag),
+			Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
+		},
+		{
+			Name:  aws.String("BUILD_COMMAND"),
+			Value: aws.String(*buildCmdFlag),
+			Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
+		},
+	},
 	})
 	if err != nil {
 		log.Fatalf("%sFailed to start CodeBuild scan: %v%s", colorRed, err, colorReset)
@@ -272,9 +321,14 @@ func main() {
 				lineNo = result.Locations[0].PhysicalLocation.Region.StartLine
 			}
 
-			levelBadge := fmt.Sprintf("%s%s[%s]%s", colorBold, colorRed, strings.ToUpper(result.Level), colorReset)
-			if strings.EqualFold(result.Level, "warning") {
-				levelBadge = fmt.Sprintf("%s%s[%s]%s", colorBold, colorYellow, strings.ToUpper(result.Level), colorReset)
+			level := result.Level
+			if level == "" {
+				level = "warning"
+			}
+
+			levelBadge := fmt.Sprintf("%s%s[%s]%s", colorBold, colorRed, strings.ToUpper(level), colorReset)
+			if strings.EqualFold(level, "warning") {
+				levelBadge = fmt.Sprintf("%s%s[%s]%s", colorBold, colorYellow, strings.ToUpper(level), colorReset)
 			}
 
 			fmt.Printf("%s %s%s%s\n", levelBadge, colorBold, result.RuleID, colorReset)
