@@ -1,0 +1,13 @@
+title = "Image source secret scanning"
+
+[extend]
+useDefault = true
+
+# Keep .env, JSON/YAML configuration, and compiled output in secret coverage.
+# A source image has no reliable Git history, so scan its filesystem snapshot.
+[[allowlists]]
+description = "Dependencies and Git internals"
+paths = [
+  '''(^|[/\\])node_modules([/\\]|$)''',
+  '''(^|[/\\])\.git([/\\]|$)''',
+]

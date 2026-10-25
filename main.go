@@ -38,28 +38,6 @@ const (
 	colorDim    = "\033[2m"
 )
 
-type SarifReport struct {
-	Runs []struct {
-		Results []struct {
-			RuleID  string `json:"ruleId"`
-			Level   string `json:"level"`
-			Message struct {
-				Text string `json:"text"`
-			} `json:"message"`
-			Locations []struct {
-				PhysicalLocation struct {
-					ArtifactLocation struct {
-						URI string `json:"uri"`
-					} `json:"artifactLocation"`
-					Region struct {
-						StartLine int `json:"startLine"`
-					} `json:"region"`
-				} `json:"physicalLocation"`
-			} `json:"locations"`
-		} `json:"results"`
-	} `json:"runs"`
-}
-
 type TokenResponse struct {
 	AccessKeyId     string `json:"accessKeyId"`
 	SecretAccessKey string `json:"secretAccessKey"`
@@ -71,8 +49,8 @@ type TokenResponse struct {
 func main() {
 	err := godotenv.Load()
 	if err != nil {
-        log.Println("No .env file found, relying on system environment variables")
-    }
+		log.Println("No .env file found, relying on system environment variables")
+	}
 	ctx := context.Background()
 
 	// 0. Parse Command Line Arguments
@@ -81,9 +59,24 @@ func main() {
 	verboseFlag := flag.Bool("verbose", false, "Enable detailed debug and raw engine output")
 	languageFlag := flag.String("lang", "javascript-typescript", "The language to scan (e.g., python, go, java-kotlin)")
 	buildCmdFlag := flag.String("build-cmd", "", "The build command for compiled languages (e.g., 'make' or 'go build')")
+	querySuiteFlag := flag.String("query-suite", "security-extended", "CodeQL suite: code-scanning, security-extended, or security-and-quality")
+	requireTypescriptFlag := flag.Bool("require-typescript", false, "Require raw application TypeScript in the extracted image source")
 	flag.BoolVar(verboseFlag, "v", false, "Shorthand for --verbose")
 	failOnVulnFlag := flag.Bool("fail-on-vuln", true, "Exit with non-zero code if security issues are discovered")
+	sarifFlag := flag.String("sarif", "", "Read a local SARIF report without contacting AWS or Docker")
 	flag.Parse()
+	switch *querySuiteFlag {
+	case "code-scanning", "security-extended", "security-and-quality":
+	default:
+		log.Fatal("Invalid --query-suite: use code-scanning, security-extended, or security-and-quality")
+	}
+	if *sarifFlag != "" {
+		body, err := os.ReadFile(*sarifFlag)
+		if err != nil {
+			log.Fatalf("Failed reading SARIF report: %v", err)
+		}
+		os.Exit(printReport(os.Stdout, body, *failOnVulnFlag, *verboseFlag))
+	}
 
 	logStep := func(step int, total int, message string) {
 		fmt.Printf("%s[%d/%d]%s %s%s%s\n", colorCyan, step, total, colorReset, colorBold, message, colorReset)
@@ -168,81 +161,49 @@ func main() {
 	encodedAuth, _ := json.Marshal(authConfig)
 	authStr := base64.URLEncoding.EncodeToString(encodedAuth)
 
-	pushOutput, err := cli.ImagePush(ctx, remoteTag, client.ImagePushOptions{
-		RegistryAuth: authStr,
-	})
-	if err != nil {
-		log.Fatalf("%sFailed to push image to ECR: %v%s", colorRed, err, colorReset)
-	}
-	defer pushOutput.Close()
-
-	if *verboseFlag {
-		io.Copy(os.Stdout, pushOutput)
-	} else {
-		// Discard verbose layer logs in minimal mode
-		pushOutput, err := cli.ImagePush(ctx, remoteTag, client.ImagePushOptions{
-		RegistryAuth: authStr,
-	})
-	if err != nil {
-		log.Fatalf("%sFailed to initiate push to ECR: %v%s", colorRed, err, colorReset)
-	}
-	defer pushOutput.Close()
-
-	// Parse the Docker engine JSON stream to catch actual push errors
-	decoder := json.NewDecoder(pushOutput)
-	for {
-		var dockerMsg struct {
-			Error  string `json:"error"`
-			Status string `json:"status"`
-			ID     string `json:"id"`
-		}
-		
-		if err := decoder.Decode(&dockerMsg); err != nil {
-			if err == io.EOF {
-				break
-			}
-			break 
-		}
-
-		// If the daemon reports an error in the stream, halt the CLI
-		if dockerMsg.Error != "" {
-			log.Fatalf("\n%s✖ Docker Push Failed: %s%s\n", colorRed, dockerMsg.Error, colorReset)
-		}
-
-		// Print verbose logs if the flag is enabled
-		if *verboseFlag && dockerMsg.Status != "" {
-			if dockerMsg.ID != "" {
-				fmt.Printf("%s: %s\n", dockerMsg.ID, dockerMsg.Status)
-			} else {
-				fmt.Println(dockerMsg.Status)
-			}
-		}
-	}
+	if err := pushWithRetry(ctx, func(pushCtx context.Context) (io.ReadCloser, error) {
+		return cli.ImagePush(pushCtx, remoteTag, client.ImagePushOptions{RegistryAuth: authStr})
+	}, os.Stdout, *verboseFlag, []time.Duration{2 * time.Second, 4 * time.Second}); err != nil {
+		log.Fatalf("%sDocker push failed: %v%s", colorRed, err, colorReset)
 	}
 
 	// 4. Trigger CodeBuild Security Scan
 	logStep(3, 4, "Triggering CodeQL security analysis...")
 	cbClient := codebuild.NewFromConfig(cfg)
+	typescriptRequirement := "0"
+	if *requireTypescriptFlag {
+		typescriptRequirement = "1"
+	}
 
 	startBuildResp, err := cbClient.StartBuild(ctx, &codebuild.StartBuildInput{
 		ProjectName: &projectName,
 		EnvironmentVariablesOverride: []codebuildTypes.EnvironmentVariable{
-		{
-			Name:  aws.String("IMAGE_URI"),
-			Value: aws.String(remoteTag),
-			Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
+			{
+				Name:  aws.String("IMAGE_URI"),
+				Value: aws.String(remoteTag),
+				Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
+			},
+			{
+				Name:  aws.String("LANGUAGE"),
+				Value: aws.String(*languageFlag),
+				Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
+			},
+			{
+				Name:  aws.String("BUILD_COMMAND"),
+				Value: aws.String(*buildCmdFlag),
+				Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
+			},
+			{
+				Name:  aws.String("CODEQL_SUITE"),
+				Value: aws.String(*querySuiteFlag),
+				Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
+			},
+			{
+				Name:  aws.String("REQUIRE_TYPESCRIPT"),
+				Value: aws.String(typescriptRequirement),
+				Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
+			},
 		},
-		{
-			Name:  aws.String("LANGUAGE"),
-			Value: aws.String(*languageFlag),
-			Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
-		},
-		{
-			Name:  aws.String("BUILD_COMMAND"),
-			Value: aws.String(*buildCmdFlag),
-			Type:  codebuildTypes.EnvironmentVariableTypePlaintext,
-		},
-	},
 	})
 	if err != nil {
 		log.Fatalf("%sFailed to start CodeBuild scan: %v%s", colorRed, err, colorReset)
@@ -295,57 +256,5 @@ func main() {
 		log.Fatalf("%sFailed reading report body: %v%s", colorRed, err, colorReset)
 	}
 
-	var report SarifReport
-	if err := json.Unmarshal(bodyBytes, &report); err != nil {
-		log.Fatalf("%sFailed parsing SARIF JSON: %v%s", colorRed, err, colorReset)
-	}
-
-	// 6. Pretty Print Findings
-	fmt.Println()
-	fmt.Printf("%s%s====================== SCAN RESULTS ======================%s\n", colorBold, colorCyan, colorReset)
-
-	vulnerabilityCount := 0
-
-	if len(report.Runs) > 0 {
-		for _, result := range report.Runs[0].Results {
-			if result.Level == "none" || strings.Contains(result.RuleID, "expected-extracted") {
-				continue
-			}
-
-			vulnerabilityCount++
-			fileUri := "Unknown"
-			lineNo := 0
-
-			if len(result.Locations) > 0 {
-				fileUri = result.Locations[0].PhysicalLocation.ArtifactLocation.URI
-				lineNo = result.Locations[0].PhysicalLocation.Region.StartLine
-			}
-
-			level := result.Level
-			if level == "" {
-				level = "warning"
-			}
-
-			levelBadge := fmt.Sprintf("%s%s[%s]%s", colorBold, colorRed, strings.ToUpper(level), colorReset)
-			if strings.EqualFold(level, "warning") {
-				levelBadge = fmt.Sprintf("%s%s[%s]%s", colorBold, colorYellow, strings.ToUpper(level), colorReset)
-			}
-
-			fmt.Printf("%s %s%s%s\n", levelBadge, colorBold, result.RuleID, colorReset)
-			fmt.Printf("   %s-->%s %s:%d\n", colorCyan, colorReset, fileUri, lineNo)
-			fmt.Printf("   %s\n\n", result.Message.Text)
-		}
-	}
-
-	fmt.Printf("%s%s==========================================================%s\n", colorBold, colorCyan, colorReset)
-
-	if vulnerabilityCount == 0 {
-		fmt.Printf("%s%s✔ SUCCESS: No security vulnerabilities found.%s\n\n", colorBold, colorGreen, colorReset)
-		os.Exit(0)
-	} else {
-		fmt.Printf("%s%s✖ FAILED: Found %d security vulnerabilities.%s\n\n", colorBold, colorRed, vulnerabilityCount, colorReset)
-		if *failOnVulnFlag {
-			os.Exit(1)
-		}
-	}
+	os.Exit(printReport(os.Stdout, bodyBytes, *failOnVulnFlag, *verboseFlag))
 }

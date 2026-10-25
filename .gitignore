@@ -1,1 +1,6 @@
 .env
+.cache/
+.scanner-tools/
+.scanner-work.*/
+report.sarif
+__pycache__/

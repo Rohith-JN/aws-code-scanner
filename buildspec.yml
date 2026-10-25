@@ -1,0 +1,41 @@
+version: 0.2
+
+env:
+  shell: bash
+  variables:
+    ECR_REGISTRY: '743050012855.dkr.ecr.ap-south-2.amazonaws.com'
+    SCAN_REGION: ap-south-2
+    BUCKET_NAME: docker-scan-results-743050012855-ap-south-2-an
+    CODEQL_SUITE: security-extended
+    REQUIRE_TYPESCRIPT: '0'
+
+phases:
+  install:
+    commands:
+      - bash scripts/install-scanners.sh .scanner-tools
+      - export PATH="$CODEBUILD_SRC_DIR/.scanner-tools/codeql:$CODEBUILD_SRC_DIR/.scanner-tools/bin:$PATH"
+      - |
+        set -euo pipefail
+        aws ecr get-login-password --region "$SCAN_REGION" |
+          docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+  build:
+    commands:
+      - bash scripts/scan-image.sh
+
+  post_build:
+    commands:
+      - |
+        set -euo pipefail
+        if [[ "${CODEBUILD_BUILD_SUCCEEDING:-0}" != 1 ]]; then
+          echo 'Scanner failed; no report will be published.' >&2
+          exit 1
+        fi
+        test -s report.sarif
+        repository="${IMAGE_URI#*/}"
+        user_id="${repository%%/*}"
+        [[ "$user_id" =~ ^[a-z0-9][a-z0-9_-]*$ ]]
+        aws s3 cp report.sarif \
+          "s3://$BUCKET_NAME/reports/$user_id/codeql-scan-$CODEBUILD_BUILD_ID.sarif" \
+          --region "$SCAN_REGION"
+        echo 'Combined CodeQL and secret scan report uploaded.'

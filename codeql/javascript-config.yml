@@ -1,0 +1,10 @@
+name: JavaScript and TypeScript source analysis
+
+# Keep source, tests, package manifests, and tsconfig files in the source root.
+# Avoid duplicate findings from compiled output and vendored dependencies.
+paths-ignore:
+  - '**/node_modules/**'
+  - '**/dist/**'
+  - '**/build/**'
+  - '**/coverage/**'
+  - '**/.git/**'
